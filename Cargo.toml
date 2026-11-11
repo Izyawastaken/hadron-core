@@ -1,0 +1,57 @@
+[package]
+name = "hadron-core"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97"
+description = "Typed, verified GitHub-backed modpack publishing and collaboration for launchers"
+license = "MIT"
+repository = "https://github.com/Izyawastaken/hadron-core"
+documentation = "https://docs.rs/hadron-core"
+readme = "README.md"
+keywords = ["modpack", "github", "launcher", "zstd", "minecraft"]
+categories = ["games", "api-bindings", "encoding"]
+include = ["src/**", "docs/**", "examples/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[features]
+default = ["github", "cache"]
+compression = ["dep:zstd", "dep:tar"]
+github = ["compression", "dep:octocrab", "dep:tokio", "dep:tokio-util", "dep:reqwest", "dep:http", "dep:http-body-util", "dep:base64"]
+cache = ["dep:tempfile"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+url = "2"
+neutrino-obscura = "1.0.0"
+zstd = { version = "0.13", optional = true }
+tar = { version = "0.4", optional = true }
+tempfile = { version = "3", optional = true }
+octocrab = { version = "0.54.9", default-features = false, features = ["default-client", "rustls", "rustls-ring"], optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+wiremock = "0.6"
+tower = { version = "0.5", features = ["util"] }
+bytes = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu"]
+
+[[example]]
+name = "offline"
+required-features = ["compression"]
+
+[[example]]
+name = "measure"
+required-features = ["compression"]
