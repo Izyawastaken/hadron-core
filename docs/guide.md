@@ -225,6 +225,8 @@ is rejected. Private repository fork policy remains enforced.
 delta. Only one added request is permitted, with existing records/applied ledger
 unchanged. It returns a request and head SHA. Owner reviews these, then passes that
 SHA to `accept`. GitHub's merge SHA precondition rejects intervening PR edits.
+`proposals` returns typed open/closed/merged state. Merged status is distinct from
+the ledger's applied marker and the selected publication's source commit.
 
 ```text
 proposed -> merged -> applied source -> prepared -> published

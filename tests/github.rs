@@ -656,6 +656,10 @@ async fn owner_request_publish_incremental_rollback_and_resume() {
         Err(Error::Conflict(_))
     ));
     let applied = h.accept(&r, 1, &reviewed, &ctx).await.unwrap();
+    assert_eq!(
+        h.proposals(&r, &ctx).await.unwrap()[0].state,
+        hadron_core::workflow::ProposalState::Merged
+    );
     assert!(matches!(
         h.reject(&r, 1, &ctx).await,
         Err(Error::Conflict(_))

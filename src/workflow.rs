@@ -33,6 +33,19 @@ pub struct Proposal {
     pub url: String,
     /// Request ID used to reconcile retries.
     pub request_id: String,
+    /// GitHub PR state; merged is distinct from applied and published.
+    pub state: ProposalState,
+}
+/// GitHub review lifecycle exposed without leaking Octocrab models.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalState {
+    /// Awaiting review or merge.
+    Open,
+    /// Closed without merging.
+    Closed,
+    /// Merged; source reconciliation/publication may still be pending.
+    Merged,
 }
 /// A prepared source snapshot. Construction fetches its exact Git commit.
 #[derive(Clone, Debug)]
@@ -812,6 +825,13 @@ fn proposal(pr: &Value, id: &str) -> Result<Proposal> {
         number: github::number(pr, "number")?,
         url: github::str_field(pr, "html_url")?.into(),
         request_id: id.into(),
+        state: if pr["merged"].as_bool() == Some(true) || pr["merged_at"].is_string() {
+            ProposalState::Merged
+        } else if pr["state"].as_str() == Some("closed") {
+            ProposalState::Closed
+        } else {
+            ProposalState::Open
+        },
     })
 }
 fn request_delta(base: &Requests, head: &Requests) -> Result<Request> {
