@@ -627,10 +627,29 @@ impl Hadron {
         owner(&self.github.repository(repo.id, ctx).await?)?;
         let snapshot = self.prepare(repo, source_commit, ctx).await?;
         let tag = format!("hadron-{id}");
-        let mut release=match self.github.get::<Value>(&format!("{}/releases/tags/{tag}",repo.route()),ctx).await {
-            Ok(v)=>v,
-            Err(Error::NotFound)=>self.github.json_call(Method::POST,&format!("{}/releases",repo.route()),Some(&json!({"tag_name":tag,"target_commitish":source_commit,"name":tag,"draft":true,"make_latest":"false","body":format!("Hadron publication {id}; source {source_commit}")})),ctx).await?,
-            Err(e)=>return Err(e),
+        let mut release = match self
+            .github
+            .get::<Value>(&format!("{}/releases/tags/{tag}", repo.route()), ctx)
+            .await
+        {
+            Ok(v) => v,
+            Err(Error::NotFound) => {
+                // The tag endpoint is specified for published releases. Drafts
+                // left by interrupted uploads must also be found before creating.
+                let releases = self
+                    .github
+                    .pages(&format!("{}/releases", repo.route()), ctx)
+                    .await?;
+                if let Some(existing) = releases
+                    .into_iter()
+                    .find(|v| v["tag_name"].as_str() == Some(&tag))
+                {
+                    existing
+                } else {
+                    self.github.json_call(Method::POST,&format!("{}/releases",repo.route()),Some(&json!({"tag_name":tag,"target_commitish":source_commit,"name":tag,"draft":true,"make_latest":"false","body":format!("Hadron publication {id}; source {source_commit}")})),ctx).await?
+                }
+            }
+            Err(e) => return Err(e),
         };
         if release["target_commitish"].as_str() != Some(source_commit)
             || release["tag_name"].as_str() != Some(&tag)

@@ -502,10 +502,13 @@ impl Respond for Fake {
             return s
                 .releases
                 .values()
-                .find(|v| v["tag_name"] == tag)
+                .find(|v| v["tag_name"] == tag && v["draft"] == false)
                 .cloned()
                 .map(response)
                 .unwrap_or_else(|| ResponseTemplate::new(404));
+        }
+        if path == format!("{prefix}/releases") && method == "GET" {
+            return response(Value::Array(s.releases.values().cloned().collect()));
         }
         if path == format!("{prefix}/releases") && method == "POST" {
             let id = s.id();
