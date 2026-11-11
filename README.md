@@ -1,7 +1,7 @@
 # hadron-core
 
 Typed GitHub-backed modpack publishing and collaboration for Tachyon and other
-launchers. Version 0.0.1, MIT licensed, Rust 1.97+.
+launchers. Version 0.0.2, MIT licensed, Rust 1.97+.
 
 Hadron translates editable JSON into frontend-ready models and verified ZSTD-9
 artifacts. Requests become PRs; the owner reviews, merges and explicitly publishes
@@ -10,7 +10,7 @@ Manifests and configs ship separately, reusing unchanged config artifacts.
 
 ```toml
 [dependencies]
-hadron-core = "=0.0.1"
+hadron-core = "=0.0.2"
 ```
 
 Use `default-features = false` for models/validation/diffs alone. Defaults include

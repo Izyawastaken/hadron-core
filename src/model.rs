@@ -124,7 +124,7 @@ pub struct Pack {
     pub name: String,
     /// Human description.
     pub description: String,
-    /// Game identifier; 0.0.1 supports `minecraft`.
+    /// Game identifier; currently supports `minecraft`.
     pub game: String,
     /// Exact game version.
     pub game_version: String,

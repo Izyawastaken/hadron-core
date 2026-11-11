@@ -272,6 +272,18 @@ async fn conditional_pointer_and_safe_pagination() {
             .len(),
         100
     );
+    let (page, more) = h
+        .proposals_page(&repo(), 1, &Context::default())
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 100);
+    assert!(more);
+    assert!(
+        !h.proposals_page(&repo(), 2, &Context::default())
+            .await
+            .unwrap()
+            .1
+    );
 }
 
 #[derive(Clone)]
@@ -280,6 +292,7 @@ struct State {
     head: String,
     files: BTreeMap<String, Vec<u8>>,
     snapshots: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+    parents: BTreeMap<String, Vec<String>>,
     blobs: BTreeMap<String, Vec<u8>>,
     trees: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     branches: BTreeMap<String, String>,
@@ -294,6 +307,7 @@ struct State {
     push: bool,
     allow_fork: bool,
     unrelated_pr_file: bool,
+    truncated_tree: bool,
 }
 impl State {
     fn new() -> Self {
@@ -312,6 +326,7 @@ impl State {
         Self {
             head: sha('a'),
             snapshots: BTreeMap::from([(sha('a'), files.clone())]),
+            parents: BTreeMap::new(),
             files,
             blobs: BTreeMap::new(),
             trees: BTreeMap::new(),
@@ -327,6 +342,7 @@ impl State {
             push: true,
             allow_fork: true,
             unrelated_pr_file: false,
+            truncated_tree: false,
         }
     }
     fn id(&mut self) -> u64 {
@@ -335,6 +351,21 @@ impl State {
     }
     fn new_sha(&mut self) -> String {
         format!("{:040x}", self.id())
+    }
+    fn ancestor(&self, base: &str, head: &str) -> bool {
+        if base == head {
+            return true;
+        }
+        self.parents
+            .get(head)
+            .is_some_and(|parents| parents.iter().any(|p| self.ancestor(base, p)))
+    }
+    fn advance(&mut self) -> String {
+        let id = self.new_sha();
+        self.parents.insert(id.clone(), vec![self.head.clone()]);
+        self.snapshots.insert(id.clone(), self.files.clone());
+        self.head = id.clone();
+        id
     }
 }
 fn response(v: Value) -> ResponseTemplate {
@@ -404,16 +435,44 @@ impl Respond for Fake {
                 .map(|b| ResponseTemplate::new(200).set_body_bytes(b.clone()))
                 .unwrap_or_else(|| ResponseTemplate::new(404));
         }
-        if path.starts_with(&format!("{prefix}/git/commits/")) {
-            return response(json!({"tree":{"sha":"base-tree"}}));
+        if let Some(pair) = path.strip_prefix(&format!("{prefix}/compare/")) {
+            let (base, head) = pair.split_once("...").unwrap();
+            let ancestor = if s.ancestor(base, head) {
+                base.to_owned()
+            } else {
+                s.snapshots
+                    .keys()
+                    .find(|c| s.ancestor(c, base) && s.ancestor(c, head))
+                    .cloned()
+                    .unwrap_or_else(|| sha('a'))
+            };
+            return response(json!({"merge_base_commit":{"sha":ancestor}}));
         }
-        if path == format!("{prefix}/git/trees/base-tree") {
-            let tree: Vec<Value> = s
-                .files
-                .iter()
-                .map(|(p, b)| json!({"path":p,"type":"blob","mode":"100644","size":b.len()}))
+        if let Some(commit) = path.strip_prefix(&format!("{prefix}/git/commits/")) {
+            if !s.snapshots.contains_key(commit) {
+                return ResponseTemplate::new(404);
+            }
+            let parents: Vec<Value> = s
+                .parents
+                .get(commit)
+                .into_iter()
+                .flatten()
+                .map(|p| json!({"sha":p}))
                 .collect();
-            return response(json!({"truncated":false,"tree":tree}));
+            return response(json!({"tree":{"sha":commit},"parents":parents}));
+        }
+        if let Some(commit) = path.strip_prefix(&format!("{prefix}/git/trees/")) {
+            let Some(files) = s.snapshots.get(commit) else {
+                return ResponseTemplate::new(404);
+            };
+            let mut tree: Vec<Value> = files
+                .iter()
+                .map(|(p, b)| json!({"path":p,"type":"blob","mode":"100644","sha":&Hash::of(b).as_str()[..40],"size":b.len(),"url":format!("https://api.github.com{}?blob={p}",original_path)}))
+                .collect();
+            if s.unrelated_pr_file && s.pr.as_ref().is_some_and(|p| p["head"]["sha"] == commit) {
+                tree.push(json!({"path":"extra.txt","type":"blob","mode":"100644","sha":sha('f'),"size":1}));
+            }
+            return response(json!({"truncated":s.truncated_tree,"tree":tree}));
         }
         if path == format!("{prefix}/git/blobs") && method == "POST" {
             let id = s.new_sha();
@@ -424,7 +483,7 @@ impl Respond for Fake {
             return response(json!({"sha":id}));
         }
         if path == format!("{prefix}/git/trees") && method == "POST" {
-            let mut tree = s.files.clone();
+            let mut tree = s.snapshots[body["base_tree"].as_str().unwrap()].clone();
             for item in body["tree"].as_array().unwrap() {
                 tree.insert(
                     item["path"].as_str().unwrap().into(),
@@ -439,6 +498,15 @@ impl Respond for Fake {
             let id = s.new_sha();
             let tree = s.trees[body["tree"].as_str().unwrap()].clone();
             s.snapshots.insert(id.clone(), tree);
+            s.parents.insert(
+                id.clone(),
+                body["parents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p.as_str().unwrap().to_owned())
+                    .collect(),
+            );
             return response(json!({"sha":id}));
         }
         if let Some(branch) = path.strip_prefix(&format!("{prefix}/git/refs/heads/")) {
@@ -489,12 +557,22 @@ impl Respond for Fake {
             if body["sha"] != pr["head"]["sha"] {
                 return ResponseTemplate::new(409);
             }
-            let tree = s.snapshots[pr["head"]["sha"].as_str().unwrap()].clone();
+            let mut tree = s.files.clone();
+            tree.insert(
+                "requests.json".into(),
+                s.snapshots[pr["head"]["sha"].as_str().unwrap()]["requests.json"].clone(),
+            );
             let id = s.new_sha();
+            let parents = vec![
+                s.head.clone(),
+                pr["head"]["sha"].as_str().unwrap().to_owned(),
+            ];
+            s.parents.insert(id.clone(), parents);
             s.snapshots.insert(id.clone(), tree.clone());
             s.files = tree;
-            s.head = id;
+            s.head = id.clone();
             pr["merged"] = true.into();
+            pr["merge_commit_sha"] = id.into();
             s.pr = Some(pr);
             return response(json!({"merged":true}));
         }
@@ -568,6 +646,15 @@ impl Respond for Fake {
 // Test transport maps even trusted upload-origin requests to the loopback fake.
 // Production upload-origin validation remains enabled, with no test-only bypass.
 fn full_client(server: &MockServer) -> Github {
+    full_client_options(
+        server,
+        Options {
+            read_retries: 0,
+            ..Options::default()
+        },
+    )
+}
+fn full_client_options(server: &MockServer, options: Options) -> Github {
     let root = server.uri();
     let http = reqwest::Client::new();
     let service = tower::service_fn(move |r: http::Request<octocrab::OctoBody>| {
@@ -606,14 +693,7 @@ fn full_client(server: &MockServer) -> Github {
         .with_auth(octocrab::AuthState::None)
         .build()
         .unwrap();
-    Github::new(
-        crab,
-        Options {
-            read_retries: 0,
-            ..Options::default()
-        },
-    )
-    .unwrap()
+    Github::new(crab, options).unwrap()
 }
 #[tokio::test]
 async fn owner_request_publish_incremental_rollback_and_resume() {
@@ -731,6 +811,8 @@ async fn fork_submission_and_private_fork_policy() {
     let r = h.github.repository(1, &ctx).await.unwrap();
     assert!(!r.permissions.push);
     assert_eq!(h.submit(&r, request(), &ctx).await.unwrap().number, 1);
+    state.lock().unwrap().pr.as_mut().unwrap()["head"]["repo"]["id"] = 2.into();
+    h.inspect(&r, 1, &ctx).await.unwrap();
     let requests = server.received_requests().await.unwrap();
     assert!(
         requests
@@ -824,4 +906,422 @@ async fn mutation_timeout_not_retried_and_stale_ref_not_forced() {
             .await,
         Err(Error::Conflict(_))
     ));
+}
+
+async fn fixture() -> (MockServer, Arc<Mutex<State>>, Hadron) {
+    let server = MockServer::start().await;
+    let state = Arc::new(Mutex::new(State::new()));
+    Mock::given(wiremock::matchers::any())
+        .respond_with(Fake(state.clone()))
+        .mount(&server)
+        .await;
+    let hadron = Hadron::new(full_client(&server));
+    (server, state, hadron)
+}
+
+#[tokio::test]
+async fn immutable_review_and_merged_provenance_survive_branch_lifecycle() {
+    let (server, state, h) = fixture().await;
+    let ctx = Context::default();
+    let r = repo();
+    h.submit(&r, request(), &ctx).await.unwrap();
+    assert!(
+        h.archive_requests(&r, &["sodium-request".into()], &sha('a'), &ctx)
+            .await
+            .is_err()
+    );
+    // Base advances after submission, including target-only source changes.
+    {
+        let mut s = state.lock().unwrap();
+        s.files
+            .insert("target-only.txt".into(), b"owner edit".to_vec());
+        let base = s.advance();
+        s.pr.as_mut().unwrap()["base"]["sha"] = base.into();
+    }
+    let (_, reviewed) = h.inspect(&r, 1, &ctx).await.unwrap();
+    state.lock().unwrap().unrelated_pr_file = true;
+    assert!(h.inspect(&r, 1, &ctx).await.is_err());
+    state.lock().unwrap().unrelated_pr_file = false;
+    state.lock().unwrap().truncated_tree = true;
+    assert!(matches!(h.inspect(&r, 1, &ctx).await, Err(Error::Limit(_))));
+    state.lock().unwrap().truncated_tree = false;
+    h.accept(&r, 1, &reviewed, &ctx).await.unwrap();
+    {
+        let mut s = state.lock().unwrap();
+        let pr = s.pr.as_mut().unwrap();
+        pr["head"]["repo"] = Value::Null;
+        pr["head"]["sha"] = sha('f').into(); // branch moved after merge
+    }
+    assert_eq!(h.inspect(&r, 1, &ctx).await.unwrap().0, request());
+    h.reconcile(&r, 1, "sodium-request", &ctx).await.unwrap();
+    let head = h.github.head(&r, &ctx).await.unwrap();
+    let archived = h
+        .archive_requests(&r, &["sodium-request".into()], &head, &ctx)
+        .await
+        .unwrap();
+    let ledger: Requests = serde_json::from_slice(
+        &h.github
+            .file(&r, "requests.json", &archived, &ctx)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(ledger.requests.is_empty());
+    assert_eq!(
+        h.reconcile(&r, 1, "sodium-request", &ctx).await.unwrap(),
+        archived
+    );
+    assert_eq!(h.submit(&r, request(), &ctx).await.unwrap().number, 1);
+    let mut collision = request();
+    collision.reason = "different data".into();
+    assert!(matches!(
+        h.submit(&r, collision, &ctx).await,
+        Err(Error::Conflict(_))
+    ));
+    let traffic = server.received_requests().await.unwrap();
+    assert!(
+        !traffic
+            .iter()
+            .any(|r| r.url.path().ends_with("/pulls/1/files"))
+    );
+    assert!(
+        traffic
+            .iter()
+            .filter(|r| r.url.path().ends_with("/pulls") && r.method == "GET")
+            .all(|r| r.url.query_pairs().any(|(key, _)| key == "head"))
+    );
+}
+
+#[tokio::test]
+async fn publication_recovers_broken_prior_and_resumes_original_index_after_selection_change() {
+    let (server, state, h) = fixture().await;
+    let ctx = Context::default();
+    let r = repo();
+    let source = sha('a');
+    let a = h.publish(&r, "a", &source, &source, &ctx).await.unwrap();
+    let old_config = a.publication.configs.clone().unwrap();
+    let removed = state.lock().unwrap().assets.remove(&old_config.id).unwrap();
+    let head = h.github.head(&r, &ctx).await.unwrap();
+    let b = h.publish(&r, "b", &source, &head, &ctx).await.unwrap();
+    assert_ne!(a.publication.configs, b.publication.configs);
+    state.lock().unwrap().assets.insert(old_config.id, removed);
+    h.select(&r, &a.latest, &b.pointer_commit, &ctx)
+        .await
+        .unwrap();
+    let head = h.github.head(&r, &ctx).await.unwrap();
+    state.lock().unwrap().fail_pointer = true;
+    assert!(h.publish(&r, "p", &source, &head, &ctx).await.is_err());
+    state.lock().unwrap().fail_pointer = false;
+    let (index_id, index_bytes) = {
+        let s = state.lock().unwrap();
+        let p = s
+            .releases
+            .values()
+            .find(|v| v["tag_name"] == "hadron-p")
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let (id, (_, bytes, _)) = s
+            .assets
+            .iter()
+            .find(|(_, (name, _, rel))| name == "publication.json" && *rel == p)
+            .unwrap();
+        (*id, bytes.clone())
+    };
+    h.select(&r, &b.latest, &head, &ctx).await.unwrap();
+    let head = h.github.head(&r, &ctx).await.unwrap();
+    let p = h.publish(&r, "p", &source, &head, &ctx).await.unwrap();
+    assert_eq!(p.latest.index.id, index_id);
+    assert_eq!(serde_json::to_vec(&p.publication).unwrap(), index_bytes);
+    assert_eq!(p.publication.configs, a.publication.configs);
+    // A new mod-only publication fetches no config source and uploads no config.
+    let before = server.received_requests().await.unwrap().len();
+    let q = h
+        .publish(&r, "q", &source, &p.pointer_commit, &ctx)
+        .await
+        .unwrap();
+    assert_eq!(p.publication.configs, q.publication.configs);
+    let traffic = server.received_requests().await.unwrap();
+    assert!(
+        !traffic[before..]
+            .iter()
+            .any(|r| r.url.path().contains("/contents/config/"))
+    );
+    assert!(!traffic[before..].iter().any(|r| {
+        r.method == "POST"
+            && r.url
+                .query_pairs()
+                .any(|(k, v)| k == "name" && v.starts_with("configs-"))
+    }));
+}
+
+#[tokio::test]
+async fn config_fetch_and_blob_envelope_have_independent_budgets() {
+    let (server, state, _) = fixture().await;
+    {
+        let mut s = state.lock().unwrap();
+        s.files.insert("config/test.toml".into(), vec![b'x'; 3000]);
+        let files = s.files.clone();
+        s.snapshots.insert(sha('a'), files);
+    }
+    let g = full_client_options(
+        &server,
+        Options {
+            limits: Limits {
+                json_bytes: 2048,
+                file_bytes: 4096,
+                ..Limits::default()
+            },
+            read_retries: 0,
+            ..Options::default()
+        },
+    );
+    let h = Hadron::new(g.clone());
+    let ctx = Context::default();
+    let snapshot = h.prepare(&repo(), &sha('a'), &ctx).await.unwrap();
+    assert_eq!(
+        snapshot.prepared.manifest.configs["config/test.toml"].size,
+        3000
+    );
+    assert!(matches!(
+        g.file(&repo(), "config/test.toml", &sha('a'), &ctx).await,
+        Err(Error::Limit(_))
+    ));
+    g.commit_files(
+        &repo(),
+        "main",
+        &sha('a'),
+        &BTreeMap::from([("large.json".into(), vec![b' '; 2048])]),
+        "boundary",
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        g.commit_files(
+            &repo(),
+            "main",
+            &sha('a'),
+            &BTreeMap::from([("large.json".into(), vec![b' '; 2049])]),
+            "over",
+            &ctx
+        )
+        .await,
+        Err(Error::Limit(_))
+    ));
+}
+
+#[tokio::test]
+async fn partial_config_edit_fetches_only_changed_source_files() {
+    let (server, state, h) = fixture().await;
+    let ctx = Context::default();
+    let r = repo();
+    {
+        let mut s = state.lock().unwrap();
+        s.files.insert("config/other.toml".into(), b"x=2".to_vec());
+        let files = s.files.clone();
+        s.snapshots.insert(sha('a'), files);
+    }
+    h.publish(&r, "a", &sha('a'), &sha('a'), &ctx)
+        .await
+        .unwrap();
+    let next = {
+        let mut s = state.lock().unwrap();
+        s.files.insert("config/other.toml".into(), b"x=3".to_vec());
+        s.advance()
+    };
+    let before = server.received_requests().await.unwrap().len();
+    let p = h.publish(&r, "b", &next, &next, &ctx).await.unwrap();
+    let loaded = h.load(&r, &p.latest, &ctx).await.unwrap();
+    assert_eq!(loaded.configs["config/other.toml"], b"x=3");
+    let traffic = server.received_requests().await.unwrap();
+    let configs: Vec<_> = traffic[before..]
+        .iter()
+        .filter(|r| r.url.path().contains("/contents/config/"))
+        .collect();
+    assert_eq!(configs.len(), 1);
+    assert!(configs[0].url.path().ends_with("/other.toml"));
+}
+
+#[tokio::test]
+async fn publication_can_replace_a_malformed_pointer_with_reviewed_head() {
+    let (_server, state, h) = fixture().await;
+    let ctx = Context::default();
+    let r = repo();
+    h.publish(&r, "a", &sha('a'), &sha('a'), &ctx)
+        .await
+        .unwrap();
+    let broken = {
+        let mut s = state.lock().unwrap();
+        s.files
+            .insert(".hadron/latest.json".into(), b"invalid JSON".to_vec());
+        s.advance()
+    };
+    let p = h.publish(&r, "b", &sha('a'), &broken, &ctx).await.unwrap();
+    assert_eq!(
+        h.open(&share::encode(1).unwrap(), &ctx)
+            .await
+            .unwrap()
+            .publication,
+        p.publication
+    );
+}
+
+#[cfg(feature = "cache")]
+#[tokio::test]
+async fn recover_cache_refetches_corruption_but_never_accepts_bad_remote_bytes() {
+    use hadron_core::cache::{Cache, CachePolicy};
+    let (_server, state, h) = fixture().await;
+    let ctx = Context::default();
+    let r = repo();
+    let published = h
+        .publish(&r, "a", &sha('a'), &sha('a'), &ctx)
+        .await
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path()).unwrap();
+    let h = h.with_cache(cache.clone());
+    h.load(&r, &published.latest, &ctx).await.unwrap();
+    let key = &published.publication.manifest.sha256;
+    std::fs::write(directory.path().join(key.as_str()), b"bad").unwrap();
+    assert!(matches!(
+        h.load(&r, &published.latest, &ctx).await,
+        Err(Error::Integrity)
+    ));
+    let h = h.with_cache_policy(CachePolicy::Recover);
+    h.load(&r, &published.latest, &ctx).await.unwrap();
+    cache.remove(key).unwrap();
+    state
+        .lock()
+        .unwrap()
+        .assets
+        .get_mut(&published.publication.manifest.id)
+        .unwrap()
+        .1 = b"bad".to_vec();
+    assert!(h.load(&r, &published.latest, &ctx).await.is_err());
+}
+
+#[tokio::test]
+async fn workflow_admission_is_bounded_and_cancellable() {
+    let (server, _state, h) = fixture().await;
+    Mock::given(path("/repositories/1/contents/pack.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(250))
+                .set_body_json(pack()),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let first = h.clone();
+    let first =
+        tokio::spawn(async move { first.prepare(&repo(), &sha('a'), &Context::default()).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path().ends_with("/pack.json"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let ctx = Context::default();
+    let r = repo();
+    let commit = sha('a');
+    let second = h.prepare(&r, &commit, &ctx);
+    tokio::pin!(second);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut second)
+            .await
+            .is_err()
+    );
+    ctx.cancellation.cancel();
+    assert!(matches!(second.await, Err(Error::Cancelled)));
+    first.await.unwrap().unwrap();
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/pack.json"))
+            .count(),
+        1
+    );
+}
+
+#[cfg(feature = "cache")]
+#[tokio::test]
+async fn cache_write_failure_is_optional_only_in_recover_mode() {
+    use hadron_core::cache::{Cache, CachePolicy};
+    let (_server, _state, h) = fixture().await;
+    let ctx = Context::default();
+    let r = repo();
+    let p = h
+        .publish(&r, "a", &sha('a'), &sha('a'), &ctx)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let cache = Cache::new(&root).unwrap();
+    std::fs::rename(&root, dir.path().join("moved-cache")).unwrap();
+    let h = h.with_cache(cache);
+    assert!(matches!(
+        h.load(&r, &p.latest, &ctx).await,
+        Err(Error::Io(_))
+    ));
+    h.with_cache_policy(CachePolicy::Recover)
+        .load(&r, &p.latest, &ctx)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pointer_metadata_has_a_bound_and_explicit_invalidation() {
+    let server = MockServer::start().await;
+    let pointer = Latest {
+        schema_version: 1,
+        publication_id: "a".into(),
+        index: Asset {
+            id: 1,
+            name: "publication.json".into(),
+            size: 1,
+            sha256: Hash::of(b"x"),
+            decoded_size: 1,
+            decoded_sha256: Hash::of(b"x"),
+        },
+    };
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"test\"")
+                .set_body_json(pointer),
+        )
+        .mount(&server)
+        .await;
+    let g = full_client(&server);
+    let ctx = Context::default();
+    for id in 1..=129 {
+        let mut r = repo();
+        r.id = id;
+        g.latest(&r, &ctx).await.unwrap();
+    }
+    g.latest(&repo(), &ctx).await.unwrap(); // First entry was evicted.
+    let mut r = repo();
+    r.id = 129;
+    g.latest(&r, &ctx).await.unwrap();
+    g.clear_metadata(Some(129)).unwrap();
+    g.latest(&r, &ctx).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests[129].headers.contains_key("if-none-match"));
+    assert!(requests[130].headers.contains_key("if-none-match"));
+    assert!(!requests[131].headers.contains_key("if-none-match"));
+    g.clear_metadata(None).unwrap();
 }

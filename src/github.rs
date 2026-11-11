@@ -64,6 +64,10 @@ pub enum Stage {
     Uploading,
     /// Advancing the stable pointer.
     Publishing,
+    /// Optional prior-artifact reuse was skipped because its data was unavailable.
+    ReuseSkipped,
+    /// Recover-mode cache read or write failed; verified remote data is used.
+    CacheSkipped,
 }
 /// Per-operation cancellation and optional progress observer.
 #[derive(Clone, Default)]
@@ -100,6 +104,8 @@ pub struct Options {
     pub concurrency: usize,
     /// Additional retries of transient GETs, capped at five.
     pub read_retries: usize,
+    /// Concurrent memory-heavy pack operations per adapter (1..=64).
+    pub workflows: usize,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -108,6 +114,7 @@ impl Default for Options {
             timeout: Duration::from_secs(60),
             concurrency: 4,
             read_retries: 2,
+            workflows: 1,
         }
     }
 }
@@ -120,6 +127,7 @@ pub struct Github {
     downloads: reqwest::Client,
     network: Arc<Semaphore>,
     pub(crate) cpu: Arc<Semaphore>,
+    pub(crate) workflows: Arc<Semaphore>,
     pointers: Arc<Mutex<PointerCache>>,
 }
 pub(crate) struct Reply {
@@ -136,6 +144,7 @@ impl Github {
             || options.concurrency > 64
             || options.read_retries > 5
             || options.timeout.is_zero()
+            || !(1..=64).contains(&options.workflows)
         {
             return Err(Error::Invalid("invalid client options".into()));
         }
@@ -148,6 +157,7 @@ impl Github {
             crab: Arc::new(crab),
             network: Arc::new(Semaphore::new(options.concurrency)),
             cpu: Arc::new(Semaphore::new(options.concurrency)),
+            workflows: Arc::new(Semaphore::new(options.workflows)),
             options,
             downloads,
             pointers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -193,6 +203,7 @@ impl Github {
         } else {
             1
         };
+        let mut body = Some(body);
         for attempt in 0..attempts {
             ctx.check()?;
             let result = self
@@ -201,12 +212,19 @@ impl Github {
                     let mut builder = http::Request::builder()
                         .method(method.clone())
                         .uri(route)
-                        .header("user-agent", "hadron-core/0.0.1");
+                        .header(
+                            "user-agent",
+                            concat!("hadron-core/", env!("CARGO_PKG_VERSION")),
+                        );
                     for (k, v) in &headers {
                         builder = builder.header(k, v);
                     }
                     let request = builder
-                        .body(body.clone())
+                        .body(if method == Method::GET {
+                            body.as_ref().cloned().unwrap_or_default()
+                        } else {
+                            body.take().unwrap_or_default()
+                        })
                         .map_err(|_| Error::Invalid("invalid internal HTTP request".into()))?;
                     let response = self
                         .crab
@@ -288,7 +306,18 @@ impl Github {
             .map(serde_json::to_vec)
             .transpose()?
             .unwrap_or_default();
-        if bytes.len() as u64 > self.options.limits.json_bytes {
+        let outbound_limit = if route.ends_with("/git/blobs") {
+            self.options
+                .limits
+                .json_bytes
+                .saturating_add(2)
+                .saturating_div(3)
+                .saturating_mul(4)
+                .saturating_add(64)
+        } else {
+            self.options.limits.json_bytes
+        };
+        if bytes.len() as u64 > outbound_limit {
             return Err(Error::Limit("outbound JSON"));
         }
         let mut headers = HeaderMap::new();
@@ -339,6 +368,18 @@ impl Github {
         commit: &str,
         ctx: &Context,
     ) -> Result<Vec<u8>> {
+        self.file_bounded(repo, path, commit, self.options.limits.json_bytes, ctx)
+            .await
+    }
+    /// Fetch a raw source file with an explicit byte budget, independent of JSON.
+    pub async fn file_bounded(
+        &self,
+        repo: &Repository,
+        path: &str,
+        commit: &str,
+        maximum: u64,
+        ctx: &Context,
+    ) -> Result<Vec<u8>> {
         validation::path(path)?;
         validation::commit(commit)?;
         let mut headers = HeaderMap::new();
@@ -357,7 +398,7 @@ impl Github {
                 ),
                 Vec::new(),
                 headers,
-                self.options.limits.json_bytes,
+                maximum,
                 ctx,
             )
             .await?;
@@ -464,6 +505,75 @@ impl Github {
         }
         Err(Error::Limit("API pages"))
     }
+    /// Discard conditional pointer metadata for one repository, or all repositories.
+    pub fn clear_metadata(&self, repository: Option<u64>) -> Result<()> {
+        let mut cache = self.pointers.lock().map_err(|_| Error::Network)?;
+        if let Some(id) = repository {
+            cache.remove(&id);
+        } else {
+            cache.clear();
+        }
+        Ok(())
+    }
+    pub(crate) async fn tree(
+        &self,
+        repo: &Repository,
+        commit: &str,
+        ctx: &Context,
+    ) -> Result<BTreeMap<String, Value>> {
+        validation::commit(commit)?;
+        let c: Value = self
+            .get(&format!("{}/git/commits/{commit}", repo.route()), ctx)
+            .await?;
+        let sha = str_field(&c["tree"], "sha")?;
+        validation::commit(sha)?;
+        let v: Value = self
+            .get(
+                &format!("{}/git/trees/{sha}?recursive=1", repo.route()),
+                ctx,
+            )
+            .await?;
+        if v["truncated"].as_bool() != Some(false) {
+            return Err(Error::Limit("truncated Git tree"));
+        }
+        let entries = v["tree"].as_array().ok_or(Error::Integrity)?;
+        if entries.len() > self.options.limits.entries {
+            return Err(Error::Limit("Git tree entries"));
+        }
+        let mut result = BTreeMap::new();
+        for e in entries {
+            let path = str_field(e, "path")?;
+            if e["type"] == "tree" {
+                continue;
+            }
+            validation::commit(str_field(e, "sha")?)?;
+            // API blob URLs differ across forks; compare only immutable Git data.
+            let identity = json!({"type":str_field(e,"type")?,"mode":str_field(e,"mode")?,"sha":str_field(e,"sha")?,"size":e["size"]});
+            if result.insert(path.into(), identity).is_some() {
+                return Err(Error::Integrity);
+            }
+        }
+        Ok(result)
+    }
+    pub(crate) async fn merge_base(
+        &self,
+        repo: &Repository,
+        base: &str,
+        head: &str,
+        ctx: &Context,
+    ) -> Result<String> {
+        validation::commit(base)?;
+        validation::commit(head)?;
+        let v: Value = self
+            .get(
+                &format!("{}/compare/{base}...{head}?per_page=1", repo.route()),
+                ctx,
+            )
+            .await?;
+        let sha = str_field(&v["merge_base_commit"], "sha")?.to_owned();
+        validation::commit(&sha)?;
+        Ok(sha)
+    }
     /// Conditional pointer read. Cache is in-memory per adapter; a fresh process
     /// re-reads discovery metadata. `None` means this repository has no pointer.
     pub async fn latest(&self, repo: &Repository, ctx: &Context) -> Result<Option<Latest>> {
@@ -509,10 +619,12 @@ impl Github {
                 return Err(api_error(&r));
             }
             if let Some(etag) = r.headers.get("etag").and_then(|h| h.to_str().ok()) {
-                self.pointers
-                    .lock()
-                    .map_err(|_| Error::Network)?
-                    .insert(repo.id, (etag.to_owned(), r.bytes.clone()));
+                let mut cache = self.pointers.lock().map_err(|_| Error::Network)?;
+                // Bound metadata even when a launcher visits many repositories.
+                if cache.len() >= 128 && !cache.contains_key(&repo.id) {
+                    cache.pop_first();
+                }
+                cache.insert(repo.id, (etag.to_owned(), r.bytes.clone()));
             } else {
                 self.pointers
                     .lock()

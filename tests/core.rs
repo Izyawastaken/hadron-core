@@ -234,3 +234,84 @@ fn cache_concurrent_writers_and_corruption() {
     std::fs::write(dir.path().join(hash.as_str()), b"damaged").unwrap();
     assert!(matches!(cache.get(&hash, 7, 100), Err(Error::Integrity)));
 }
+
+#[cfg(feature = "compression")]
+#[test]
+fn manifest_json_budget_matches_consumer_and_streaming_checks_full_frame() {
+    use hadron_core::codec;
+    let m = manifest();
+    let raw = serde_json::to_vec(&m).unwrap();
+    let mut limits = Limits {
+        json_bytes: raw.len() as u64,
+        ..Limits::default()
+    };
+    let p = codec::prepare(m.clone(), &BTreeMap::new(), &limits).unwrap();
+    let a = p.manifest_artifact.asset(1, "manifest".into());
+    let decoded = codec::decode(&p.manifest_artifact.bytes, &a, &limits).unwrap();
+    assert_eq!(validation::json::<Manifest>(&decoded, &limits).unwrap(), m);
+    limits.json_bytes -= 1;
+    assert!(matches!(
+        codec::prepare(m.clone(), &BTreeMap::new(), &limits),
+        Err(Error::Limit("manifest JSON"))
+    ));
+    let small_window = Limits {
+        window_log: 10,
+        ..Limits::default()
+    };
+    let p = codec::prepare(m.clone(), &BTreeMap::new(), &small_window).unwrap();
+    codec::decode(
+        &p.manifest_artifact.bytes,
+        &p.manifest_artifact.asset(1, "small".into()),
+        &small_window,
+    )
+    .unwrap();
+
+    let limits = Limits::default();
+    let files = BTreeMap::from([("config/a".into(), vec![42; 1024])]);
+    let p = codec::prepare(m, &files, &limits).unwrap();
+    let frame = p.config_artifact.unwrap();
+    let mut a = frame.asset(1, "config".into());
+    a.decoded_sha256 = Hash::of(b"wrong");
+    assert!(matches!(
+        codec::configs(&frame.bytes, &a, &p.manifest, &limits),
+        Err(Error::Integrity)
+    ));
+    let a = frame.asset(1, "config".into());
+    let mut short = a.clone();
+    short.decoded_size -= 1;
+    assert!(codec::configs(&frame.bytes, &short, &p.manifest, &limits).is_err());
+    // Trailing decoded bytes count toward the full hash and byte budget.
+    let mut tar = codec::decode(&frame.bytes, &a, &limits).unwrap();
+    tar.extend_from_slice(b"trailing");
+    let extra = codec::encode(&tar, &limits).unwrap();
+    assert_eq!(
+        codec::configs(
+            &extra.bytes,
+            &extra.asset(1, "extra".into()),
+            &p.manifest,
+            &limits
+        )
+        .unwrap(),
+        files
+    );
+    let tiny = Limits {
+        decoded_bytes: 100,
+        ..limits
+    };
+    assert!(codec::configs(&frame.bytes, &a, &p.manifest, &tiny).is_err());
+}
+
+#[cfg(feature = "cache")]
+#[test]
+fn explicit_cache_budget_preserves_foreign_files() {
+    use hadron_core::cache::Cache;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Cache::new(dir.path()).unwrap();
+    cache.put(&Hash::of(b"abc"), b"abc").unwrap();
+    cache.put(&Hash::of(b"defg"), b"defg").unwrap();
+    std::fs::write(dir.path().join("foreign.txt"), b"retain").unwrap();
+    assert_eq!(cache.size().unwrap(), 7);
+    assert!(cache.prune(3).unwrap() >= 4);
+    assert!(cache.size().unwrap() <= 3);
+    assert!(dir.path().join("foreign.txt").exists());
+}

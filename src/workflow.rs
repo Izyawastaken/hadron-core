@@ -72,6 +72,8 @@ pub struct Hadron {
     pub github: Github,
     #[cfg(feature = "cache")]
     cache: Option<crate::cache::Cache>,
+    #[cfg(feature = "cache")]
+    cache_policy: crate::cache::CachePolicy,
 }
 impl Hadron {
     /// Create without persistent artifact cache.
@@ -80,6 +82,8 @@ impl Hadron {
             github,
             #[cfg(feature = "cache")]
             cache: None,
+            #[cfg(feature = "cache")]
+            cache_policy: crate::cache::CachePolicy::Strict,
         }
     }
     /// Enable caller-owned disk cache. It is safe to reuse across repositories:
@@ -88,6 +92,19 @@ impl Hadron {
     pub fn with_cache(mut self, cache: crate::cache::Cache) -> Self {
         self.cache = Some(cache);
         self
+    }
+    /// Select strict cache errors (default), or recovery using verified remote data.
+    #[cfg(feature = "cache")]
+    pub fn with_cache_policy(mut self, policy: crate::cache::CachePolicy) -> Self {
+        self.cache_policy = policy;
+        self
+    }
+    async fn admission(&self, ctx: &Context) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        ctx.check()?;
+        tokio::select! {
+            _ = ctx.cancellation.cancelled() => Err(Error::Cancelled),
+            p = self.github.workflows.clone().acquire_owned() => p.map_err(|_| Error::Cancelled),
+        }
     }
     async fn blocking<T: Send + 'static>(
         &self,
@@ -107,21 +124,51 @@ impl Hadron {
     async fn bytes(&self, repo: &Repository, asset: &Asset, ctx: &Context) -> Result<Vec<u8>> {
         #[cfg(feature = "cache")]
         if let Some(cache) = self.cache.clone() {
-            let asset = asset.clone();
+            let a = asset.clone();
             let max = self.github.options.limits.compressed_bytes;
-            if let Some(bytes) = self
-                .blocking(ctx, move || cache.get(&asset.sha256, asset.size, max))
-                .await?
-            {
-                return Ok(bytes);
+            let policy = self.cache_policy;
+            let result = self
+                .blocking(ctx, move || match cache.get(&a.sha256, a.size, max) {
+                    Err(Error::Integrity) if policy == crate::cache::CachePolicy::Recover => {
+                        cache.remove(&a.sha256)?;
+                        Err(Error::Integrity)
+                    }
+                    other => other,
+                })
+                .await;
+            match result {
+                Ok(Some(bytes)) => return Ok(bytes),
+                Ok(None) => {}
+                Err(Error::Integrity | Error::Io(_))
+                    if policy == crate::cache::CachePolicy::Recover =>
+                {
+                    ctx.emit(Stage::CacheSkipped)?
+                }
+                Err(e) => return Err(e),
             }
         }
         let bytes = self.github.asset(repo, asset, ctx).await?;
         #[cfg(feature = "cache")]
         if let Some(cache) = self.cache.clone() {
             let hash = asset.sha256.clone();
-            let copy = bytes.clone();
-            self.blocking(ctx, move || cache.put(&hash, &copy)).await?;
+            // Move the buffer through blocking I/O rather than copying artifacts.
+            let policy = self.cache_policy;
+            let (bytes, result) = self
+                .blocking(ctx, move || {
+                    let result = cache.put(&hash, &bytes);
+                    Ok((bytes, result))
+                })
+                .await?;
+            match result {
+                Ok(()) => {}
+                Err(Error::Integrity | Error::Io(_))
+                    if policy == crate::cache::CachePolicy::Recover =>
+                {
+                    ctx.emit(Stage::CacheSkipped)?
+                }
+                Err(e) => return Err(e),
+            }
+            return Ok(bytes);
         }
         Ok(bytes)
     }
@@ -137,6 +184,15 @@ impl Hadron {
     }
     /// Load an index selected by a current or historical verified pointer.
     pub async fn load(&self, repo: &Repository, latest: &Latest, ctx: &Context) -> Result<Loaded> {
+        let _admission = self.admission(ctx).await?;
+        self.load_inner(repo, latest, ctx).await
+    }
+    async fn index(
+        &self,
+        repo: &Repository,
+        latest: &Latest,
+        ctx: &Context,
+    ) -> Result<Publication> {
         validation::schema(latest.schema_version)?;
         let index = self.bytes(repo, &latest.index, ctx).await?;
         if latest.index.decoded_size != latest.index.size
@@ -149,6 +205,15 @@ impl Hadron {
             return Err(Error::Integrity);
         }
         validation::publication(&publication, repo.id, &self.github.options.limits)?;
+        Ok(publication)
+    }
+    async fn metadata(
+        &self,
+        repo: &Repository,
+        latest: &Latest,
+        ctx: &Context,
+    ) -> Result<(Publication, Manifest)> {
+        let publication = self.index(repo, latest, ctx).await?;
         let bytes = self.bytes(repo, &publication.manifest, ctx).await?;
         let asset = publication.manifest.clone();
         let limits = self.github.options.limits.clone();
@@ -161,6 +226,15 @@ impl Hadron {
         if manifest.pack.id != publication.pack_id {
             return Err(Error::Integrity);
         }
+        Ok((publication, manifest))
+    }
+    async fn load_inner(
+        &self,
+        repo: &Repository,
+        latest: &Latest,
+        ctx: &Context,
+    ) -> Result<Loaded> {
+        let (publication, manifest) = self.metadata(repo, latest, ctx).await?;
         let configs = match &publication.configs {
             Some(asset) => {
                 let bytes = self.bytes(repo, asset, ctx).await?;
@@ -235,6 +309,16 @@ impl Hadron {
         commit: &str,
         ctx: &Context,
     ) -> Result<Snapshot> {
+        let _admission = self.admission(ctx).await?;
+        Ok(self.prepare_inner(repo, commit, None, ctx).await?.0)
+    }
+    async fn prepare_inner(
+        &self,
+        repo: &Repository,
+        commit: &str,
+        previous: Option<&(Publication, Manifest)>,
+        ctx: &Context,
+    ) -> Result<(Snapshot, Option<Asset>)> {
         validation::commit(commit)?;
         let pack: Pack = validation::json(
             &self.github.file(repo, "pack.json", commit, ctx).await?,
@@ -244,39 +328,15 @@ impl Hadron {
             &self.github.file(repo, "mods.json", commit, ctx).await?,
             &self.github.options.limits,
         )?;
-        let commit_data: Value = self
-            .github
-            .get(&format!("{}/git/commits/{commit}", repo.route()), ctx)
-            .await?;
-        let tree: Value = self
-            .github
-            .get(
-                &format!(
-                    "{}/git/trees/{}?recursive=1",
-                    repo.route(),
-                    github::str_field(&commit_data["tree"], "sha")?
-                ),
-                ctx,
-            )
-            .await?;
-        if tree["truncated"].as_bool() != Some(false) {
-            return Err(Error::Limit("truncated Git tree"));
-        }
-        let entries = tree["tree"].as_array().ok_or(Error::Integrity)?;
-        if entries.len() > self.github.options.limits.entries {
-            return Err(Error::Limit("Git tree entries"));
-        }
+        let entries = self.github.tree(repo, commit, ctx).await?;
         let mut configs = BTreeMap::new();
         let mut total = 0u64;
-        for entry in entries {
-            let path = github::str_field(entry, "path")?;
+        let mut wanted = Vec::new();
+        for (path, entry) in &entries {
             if !path.starts_with("config/") {
                 continue;
             }
             validation::path(path)?;
-            if entry["type"] == "tree" {
-                continue;
-            }
             if entry["type"] != "blob"
                 || !matches!(entry["mode"].as_str(), Some("100644" | "100755"))
             {
@@ -290,13 +350,117 @@ impl Hadron {
             if total > self.github.options.limits.decoded_bytes {
                 return Err(Error::Limit("configs"));
             }
-            let bytes = self.github.file(repo, path, commit, ctx).await?;
-            if bytes.len() as u64 != size {
-                return Err(Error::Integrity);
-            }
-            configs.insert(path.into(), bytes);
+            wanted.push((path.clone(), size));
         }
         ctx.emit(Stage::Preparing)?;
+        if let Some((publication, manifest)) = previous {
+            let reuse = async {
+                let old = self
+                    .github
+                    .tree(repo, &publication.source_commit, ctx)
+                    .await?;
+                let filtered = |tree: &BTreeMap<String, Value>| -> BTreeMap<String, Value> {
+                    tree.iter()
+                        .filter(|(p, _)| p.starts_with("config/"))
+                        .map(|(p, v)| (p.clone(), v.clone()))
+                        .collect()
+                };
+                let unchanged = filtered(&old) == filtered(&entries);
+                let mut next = Manifest {
+                    pack: pack.clone(),
+                    mods: mods.mods.clone(),
+                    configs: manifest.configs.clone(),
+                };
+                let old_configs = if let Some(asset) = &publication.configs {
+                    let bytes = self.github.asset(repo, asset, ctx).await?;
+                    let a = asset.clone();
+                    let m = manifest.clone();
+                    let limits = self.github.options.limits.clone();
+                    self.blocking(ctx, move || codec::configs(&bytes, &a, &m, &limits))
+                        .await?
+                } else if !wanted.is_empty() {
+                    if unchanged {
+                        return Err(Error::Integrity);
+                    }
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::new()
+                };
+                if !unchanged {
+                    // Only reuse bytes whose immutable Git blob identity, mode and
+                    // size are unchanged, after verifying the entire old archive.
+                    for (path, bytes) in old_configs {
+                        if entries.contains_key(&path) && old.get(&path) == entries.get(&path) {
+                            configs.insert(path, bytes);
+                        }
+                    }
+                    return Ok(None);
+                }
+                // A config-empty source must also have an empty published inventory.
+                if wanted.is_empty() {
+                    next.configs.clear();
+                }
+                let limits = self.github.options.limits.clone();
+                let prepared = self
+                    .blocking(ctx, move || {
+                        Ok(Prepared {
+                            manifest_artifact: codec::encode_manifest(&next, &limits)?,
+                            manifest: next,
+                            config_artifact: None,
+                        })
+                    })
+                    .await?;
+                Ok(Some((
+                    Snapshot {
+                        commit: commit.into(),
+                        prepared,
+                    },
+                    publication.configs.clone(),
+                )))
+            }
+            .await;
+            match reuse {
+                Ok(Some(value)) => return Ok(value),
+                Ok(None) => {}
+                Err(e) if reusable_failure(&e) => ctx.emit(Stage::ReuseSkipped)?,
+                Err(e) => return Err(e),
+            }
+        }
+        // A bounded JoinSet admits at most concurrency source buffers at a time.
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut wanted = wanted
+            .into_iter()
+            .filter(|(path, _)| !configs.contains_key(path))
+            .collect::<Vec<_>>()
+            .into_iter();
+        loop {
+            while tasks.len() < self.github.options.concurrency {
+                let Some((path, size)) = wanted.next() else {
+                    break;
+                };
+                let github = self.github.clone();
+                let repo = repo.clone();
+                let commit = commit.to_owned();
+                let ctx = ctx.clone();
+                tasks.spawn(async move {
+                    let bytes = github
+                        .file_bounded(&repo, &path, &commit, size, &ctx)
+                        .await?;
+                    if bytes.len() as u64 != size {
+                        return Err(Error::Integrity);
+                    }
+                    Ok((path, bytes))
+                });
+            }
+            if tasks.is_empty() {
+                break;
+            }
+            let result = tokio::select! { _ = ctx.cancellation.cancelled() => return Err(Error::Cancelled), r = tasks.join_next() => r };
+            let (path, bytes) = result
+                .ok_or(Error::Cancelled)?
+                .map_err(|_| Error::Network)??;
+            configs.insert(path, bytes);
+        }
         let limits = self.github.options.limits.clone();
         let prepared = self
             .blocking(ctx, move || {
@@ -311,10 +475,13 @@ impl Hadron {
                 )
             })
             .await?;
-        Ok(Snapshot {
-            commit: commit.into(),
-            prepared,
-        })
+        Ok((
+            Snapshot {
+                commit: commit.into(),
+                prepared,
+            },
+            None,
+        ))
     }
     /// List request PRs (including closed/merged) identified by Hadron's branch prefix.
     pub async fn proposals(&self, repo: &Repository, ctx: &Context) -> Result<Vec<Proposal>> {
@@ -332,6 +499,41 @@ impl Hadron {
             .map(|(p, id)| proposal(p, id))
             .collect()
     }
+    /// List one bounded page of PR history. An empty page ends iteration; filtering
+    /// may yield an empty proposal list even when the raw PR page is nonempty.
+    /// Returns `(proposals, has_more)`; request the next page when `has_more` is true.
+    pub async fn proposals_page(
+        &self,
+        repo: &Repository,
+        page: u32,
+        ctx: &Context,
+    ) -> Result<(Vec<Proposal>, bool)> {
+        if page == 0 {
+            return Err(Error::Invalid("page starts at one".into()));
+        }
+        let prs: Vec<Value> = self
+            .github
+            .get(
+                &format!("{}/pulls?state=all&per_page=100&page={page}", repo.route()),
+                ctx,
+            )
+            .await?;
+        if prs.len() > 100 {
+            return Err(Error::Limit("PR page"));
+        }
+        let more = prs.len() == 100;
+        let proposals = prs
+            .iter()
+            .filter_map(|p| {
+                p["head"]["ref"]
+                    .as_str()
+                    .and_then(|r| r.strip_prefix("hadron-request-"))
+                    .map(|id| (p, id))
+            })
+            .map(|(p, id)| proposal(p, id))
+            .collect::<Result<_>>()?;
+        Ok((proposals, more))
+    }
     /// Open an exact request PR. On a retry, returns the existing PR for its unique
     /// branch. Fork creation may be asynchronous: retry after NotFound/Conflict.
     pub async fn submit(
@@ -342,8 +544,50 @@ impl Hadron {
     ) -> Result<Proposal> {
         validation::key(&request.id)?;
         validation::commit(&request.base_commit)?;
+        let current = self.github.head(repo, ctx).await?;
+        if let Some(record) = self.archived(repo, &current, &request.id, ctx).await? {
+            if record.requests.get(&request.id) != Some(&request) {
+                return Err(Error::Conflict(
+                    "request ID is archived with different data".into(),
+                ));
+            }
+            let number = *record.applied.get(&request.id).ok_or(Error::Integrity)?;
+            let pr: Value = self
+                .github
+                .get(&format!("{}/pulls/{number}", repo.route()), ctx)
+                .await?;
+            if pr["merged"].as_bool() != Some(true) {
+                return Err(Error::Integrity);
+            }
+            return proposal(&pr, &request.id);
+        }
         let branch = format!("hadron-request-{}", request.id);
-        let existing = self.proposals(repo, ctx).await?;
+        let login = if repo.permissions.push {
+            repo.full_name
+                .split('/')
+                .next()
+                .ok_or(Error::Integrity)?
+                .to_owned()
+        } else {
+            let user: Value = self.github.get("/user", ctx).await?;
+            github::str_field(&user, "login")?.to_owned()
+        };
+        let existing: Vec<Value> = self
+            .github
+            .pages(
+                &format!(
+                    "{}/pulls?state=all&head={}&base={}",
+                    repo.route(),
+                    github::segment(&format!("{login}:{branch}")),
+                    github::segment(&repo.default_branch)
+                ),
+                ctx,
+            )
+            .await?;
+        let existing = existing
+            .iter()
+            .map(|p| proposal(p, &request.id))
+            .collect::<Result<Vec<_>>>()?;
         if let Some(p) = existing.into_iter().find(|p| p.request_id == request.id) {
             if self.inspect(repo, p.number, ctx).await?.0 != request {
                 return Err(Error::Conflict(
@@ -352,7 +596,6 @@ impl Hadron {
             }
             return Ok(p);
         }
-        let current = self.github.head(repo, ctx).await?;
         if current != request.base_commit {
             return Err(Error::Conflict("request base no longer current".into()));
         }
@@ -469,31 +712,70 @@ impl Hadron {
         {
             return Err(Error::Invalid("PR targets another pack or branch".into()));
         }
-        let files = self
-            .github
-            .pages(&format!("{}/pulls/{number}/files", repo.route()), ctx)
-            .await?;
-        if files.len() != 1
-            || files[0]["filename"] != "requests.json"
-            || !matches!(files[0]["status"].as_str(), Some("added" | "modified"))
+        let reviewed_sha = github::str_field(&pr["head"], "sha")?.to_owned();
+        validation::commit(&reviewed_sha)?;
+        let merged = pr["merged"].as_bool() == Some(true);
+        let (base_sha, head_sha, head_repo) = if merged {
+            // Merge/squash/rebase result survives deleted forks and moving heads.
+            // A multi-commit rebase whose final commit is not the complete request
+            // delta fails closed; Hadron itself uses a single merge commit.
+            let sha = github::str_field(&pr, "merge_commit_sha")?.to_owned();
+            validation::commit(&sha)?;
+            let c: Value = self
+                .github
+                .get(&format!("{}/git/commits/{sha}", repo.route()), ctx)
+                .await?;
+            let parent = c["parents"]
+                .as_array()
+                .and_then(|p| p.first())
+                .ok_or(Error::Integrity)?;
+            (
+                github::str_field(parent, "sha")?.to_owned(),
+                sha,
+                repo.clone(),
+            )
+        } else {
+            let base = github::str_field(&pr["base"], "sha")?;
+            let merge_base = self
+                .github
+                .merge_base(repo, base, &reviewed_sha, ctx)
+                .await?;
+            let head_repo = Repository {
+                id: github::number(&pr["head"]["repo"], "id")?,
+                ..repo.clone()
+            };
+            (merge_base, reviewed_sha.clone(), head_repo)
+        };
+        let mut before = self.github.tree(repo, &base_sha, ctx).await?;
+        let mut after = self.github.tree(&head_repo, &head_sha, ctx).await?;
+        let old_request = before.remove("requests.json");
+        let new_request = after.remove("requests.json").ok_or(Error::Integrity)?;
+        if before != after
+            || old_request.as_ref() == Some(&new_request)
+            || new_request["type"] != "blob"
+            || new_request["mode"] != "100644"
         {
             return Err(Error::Invalid(
-                "request PR must change only requests.json".into(),
+                "request PR must change only regular requests.json".into(),
             ));
         }
-        let base_sha = github::str_field(&pr["base"], "sha")?;
-        let head_sha = github::str_field(&pr["head"], "sha")?.to_owned();
-        let head_repo = self
-            .github
-            .repository(github::number(&pr["head"]["repo"], "id")?, ctx)
-            .await?;
-        let base = self.github.ledger(repo, base_sha, ctx).await?;
+        let base = self.github.ledger(repo, &base_sha, ctx).await?;
         let head = self.github.ledger(&head_repo, &head_sha, ctx).await?;
         let request = request_delta(&base, &head)?;
+        if self
+            .github
+            .merge_base(repo, &request.base_commit, &base_sha, ctx)
+            .await?
+            != request.base_commit
+        {
+            return Err(Error::Invalid(
+                "request base is not an ancestor of comparison base".into(),
+            ));
+        }
         if pr["head"]["ref"].as_str() != Some(&format!("hadron-request-{}", request.id)) {
             return Err(Error::Invalid("request branch ID mismatch".into()));
         }
-        Ok((request, head_sha))
+        Ok((request, reviewed_sha))
     }
     /// Merge only the SHA reviewed by the owner, then reconcile source exactly once.
     /// Permission is checked fresh; branch protection may still reject the merge.
@@ -561,24 +843,37 @@ impl Hadron {
         ctx: &Context,
     ) -> Result<String> {
         owner(&self.github.repository(repo.id, ctx).await?)?;
-        let (reviewed, _) = self.inspect(repo, number, ctx).await?;
         let pr: Value = self
             .github
             .get(&format!("{}/pulls/{number}", repo.route()), ctx)
             .await?;
-        if pr["merged"].as_bool() != Some(true) || reviewed.id != id {
+        if pr["merged"].as_bool() != Some(true)
+            || pr["base"]["repo"]["id"].as_u64() != Some(repo.id)
+            || pr["base"]["ref"].as_str() != Some(&repo.default_branch)
+        {
             return Err(Error::Invalid("request not merged or mismatched ID".into()));
         }
         let head = self.github.head(repo, ctx).await?;
         let mut ledger = self.github.ledger(repo, &head, ctx).await?;
-        if ledger.requests.get(id) != Some(&reviewed) {
-            return Err(Error::Conflict("merged request changed in source".into()));
+        if !ledger.requests.contains_key(id)
+            && let Some(record) = self.archived(repo, &head, id, ctx).await?
+        {
+            if record.applied.get(id) == Some(&number) {
+                return Ok(head);
+            }
+            return Err(Error::Conflict(
+                "request archived under different PR".into(),
+            ));
         }
         if let Some(applied) = ledger.applied.get(id) {
             if *applied != number {
                 return Err(Error::Conflict("request applied by different PR".into()));
             }
             return Ok(head);
+        }
+        let (reviewed, _) = self.inspect(repo, number, ctx).await?;
+        if reviewed.id != id || ledger.requests.get(id) != Some(&reviewed) {
+            return Err(Error::Conflict("merged request changed in source".into()));
         }
         let mut candidate = self.source_manifest(repo, &head, ctx).await?;
         let next = reviewed.operation.apply(&ModList {
@@ -597,6 +892,82 @@ impl Hadron {
                     ("requests.json".into(), serde_json::to_vec_pretty(&ledger)?),
                 ]),
                 &format!("Apply request {id} (PR #{number})"),
+                ctx,
+            )
+            .await
+    }
+    async fn archived(
+        &self,
+        repo: &Repository,
+        sha: &str,
+        id: &str,
+        ctx: &Context,
+    ) -> Result<Option<Requests>> {
+        validation::key(id)?;
+        let bytes = match self
+            .github
+            .file(repo, &format!(".hadron/requests/{id}.json"), sha, ctx)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(Error::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let record: Requests = validation::json(&bytes, &self.github.options.limits)?;
+        validation::requests(&record, &self.github.options.limits)?;
+        if record.requests.len() != 1
+            || record.applied.len() != 1
+            || !record.requests.contains_key(id)
+        {
+            return Err(Error::Integrity);
+        }
+        Ok(Some(record))
+    }
+    /// Explicitly archive applied requests into immutable per-ID source records.
+    /// Ledger removal and archive creation share a guarded atomic commit. Archived
+    /// IDs remain reserved and reconciliation remains idempotent. Pending requests
+    /// cannot be archived. Old 0.0.1 clients must not write to an archived repository.
+    pub async fn archive_requests(
+        &self,
+        repo: &Repository,
+        ids: &[String],
+        expected_head: &str,
+        ctx: &Context,
+    ) -> Result<String> {
+        owner(&self.github.repository(repo.id, ctx).await?)?;
+        if ids.is_empty() || ids.len().saturating_add(1) > self.github.options.limits.entries {
+            return Err(Error::Limit("archive entries"));
+        }
+        let mut ledger = self.github.ledger(repo, expected_head, ctx).await?;
+        let mut files = BTreeMap::new();
+        for id in ids {
+            validation::key(id)?;
+            if self.archived(repo, expected_head, id, ctx).await?.is_some() {
+                return Err(Error::Conflict("request already archived".into()));
+            }
+            let number = ledger
+                .applied
+                .remove(id)
+                .ok_or_else(|| Error::Conflict("only applied requests can be archived".into()))?;
+            let request = ledger.requests.remove(id).ok_or(Error::Integrity)?;
+            let record = Requests {
+                schema_version: 1,
+                requests: BTreeMap::from([(id.clone(), request)]),
+                applied: BTreeMap::from([(id.clone(), number)]),
+            };
+            files.insert(
+                format!(".hadron/requests/{id}.json"),
+                serde_json::to_vec_pretty(&record)?,
+            );
+        }
+        files.insert("requests.json".into(), serde_json::to_vec_pretty(&ledger)?);
+        self.github
+            .commit_files(
+                repo,
+                &repo.default_branch,
+                expected_head,
+                &files,
+                "Archive applied Hadron requests",
                 ctx,
             )
             .await
@@ -634,11 +1005,11 @@ impl Hadron {
         expected_head: &str,
         ctx: &Context,
     ) -> Result<Published> {
+        let _admission = self.admission(ctx).await?;
         validation::key(id)?;
         validation::commit(source_commit)?;
         validation::commit(expected_head)?;
         owner(&self.github.repository(repo.id, ctx).await?)?;
-        let snapshot = self.prepare(repo, source_commit, ctx).await?;
         let tag = format!("hadron-{id}");
         let mut release = match self
             .github
@@ -671,36 +1042,61 @@ impl Hadron {
                 "publication ID already belongs to another source".into(),
             ));
         }
-        let prior = self.github.latest(repo, ctx).await?;
-        let previous = if let Some(pointer) = prior.as_ref() {
-            Some(self.load(repo, pointer, ctx).await?)
+        let existing = self.release_pointer(repo, &release, id, ctx).await?;
+        let (publication, latest) = if let Some(latest) = existing {
+            let loaded = self.load_inner(repo, &latest, ctx).await?;
+            if loaded.publication.source_commit != source_commit {
+                return Err(Error::Integrity);
+            }
+            let snapshot = self.prepare_inner(repo, source_commit, None, ctx).await?.0;
+            if loaded.manifest != snapshot.prepared.manifest {
+                return Err(Error::Integrity);
+            }
+            match (
+                &loaded.publication.configs,
+                &snapshot.prepared.config_artifact,
+            ) {
+                (Some(a), Some(b))
+                    if a.decoded_sha256 == b.decoded_sha256 && a.decoded_size == b.decoded_size => {
+                }
+                (None, None) => {}
+                _ => return Err(Error::Integrity),
+            }
+            (loaded.publication, latest)
         } else {
-            None
-        };
-        ctx.emit(Stage::Uploading)?;
-        let prepared = snapshot.prepared;
-        let m = &prepared.manifest_artifact;
-        let uploaded = self
-            .github
-            .upload(
-                repo,
-                &release,
-                &format!("manifest-{}.json.zst", m.sha256.as_str()),
-                &m.bytes,
-                ctx,
-            )
-            .await?;
-        let manifest = m.asset(uploaded.id, uploaded.name);
-        let configs = if let Some(c) = &prepared.config_artifact {
-            if let Some(reusable) = previous
-                .as_ref()
-                .and_then(|p| p.publication.configs.as_ref())
-                .filter(|a| {
-                    a.decoded_sha256 == c.decoded_sha256 && a.decoded_size == c.decoded_size
-                })
+            let previous = match async {
+                match self.github.latest(repo, ctx).await? {
+                    Some(pointer) => self.metadata(repo, &pointer, ctx).await.map(Some),
+                    None => Ok(None),
+                }
+            }
+            .await
             {
-                Some(reusable.clone())
-            } else {
+                Ok(p) => p,
+                Err(e) if reusable_failure(&e) => {
+                    ctx.emit(Stage::ReuseSkipped)?;
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            let (snapshot, reused) = self
+                .prepare_inner(repo, source_commit, previous.as_ref(), ctx)
+                .await?;
+            ctx.emit(Stage::Uploading)?;
+            let prepared = snapshot.prepared;
+            let m = &prepared.manifest_artifact;
+            let uploaded = self
+                .github
+                .upload(
+                    repo,
+                    &release,
+                    &format!("manifest-{}.json.zst", m.sha256.as_str()),
+                    &m.bytes,
+                    ctx,
+                )
+                .await?;
+            let manifest = m.asset(uploaded.id, uploaded.name);
+            let configs = if let Some(c) = &prepared.config_artifact {
                 let uploaded = self
                     .github
                     .upload(
@@ -712,31 +1108,35 @@ impl Hadron {
                     )
                     .await?;
                 Some(c.asset(uploaded.id, uploaded.name))
+            } else {
+                reused
+            };
+            let publication = Publication {
+                schema_version: 1,
+                repository_id: repo.id,
+                pack_id: prepared.manifest.pack.id,
+                id: id.into(),
+                source_commit: source_commit.into(),
+                manifest,
+                configs,
+            };
+            let index_bytes = serde_json::to_vec(&publication)?;
+            if index_bytes.len() as u64 > self.github.options.limits.json_bytes {
+                return Err(Error::Limit("publication JSON"));
             }
-        } else {
-            None
+            let index = self
+                .github
+                .upload(repo, &release, "publication.json", &index_bytes, ctx)
+                .await?;
+            let latest = Latest {
+                schema_version: 1,
+                publication_id: id.into(),
+                index,
+            };
+            // Confirm the entire consumer path before advertising this version.
+            self.load_inner(repo, &latest, ctx).await?;
+            (publication, latest)
         };
-        let publication = Publication {
-            schema_version: 1,
-            repository_id: repo.id,
-            pack_id: prepared.manifest.pack.id,
-            id: id.into(),
-            source_commit: source_commit.into(),
-            manifest,
-            configs,
-        };
-        let index_bytes = serde_json::to_vec(&publication)?;
-        let index = self
-            .github
-            .upload(repo, &release, "publication.json", &index_bytes, ctx)
-            .await?;
-        let latest = Latest {
-            schema_version: 1,
-            publication_id: id.into(),
-            index,
-        };
-        // Confirm the entire consumer path before advertising this version.
-        self.load(repo, &latest, ctx).await?;
         let release_id = github::number(&release, "id")?;
         if release["draft"].as_bool() == Some(true) {
             release = self
@@ -754,7 +1154,14 @@ impl Hadron {
         }
         ctx.emit(Stage::Publishing)?;
         // An interrupted pointer write is idempotent when already selected.
-        let current = self.github.latest(repo, ctx).await?;
+        let current = match self.github.latest(repo, ctx).await {
+            Ok(current) => current,
+            Err(e) if reusable_failure(&e) => {
+                ctx.emit(Stage::ReuseSkipped)?;
+                None
+            }
+            Err(e) => return Err(e),
+        };
         if current.as_ref() == Some(&latest) {
             return Ok(Published {
                 publication,
@@ -787,6 +1194,45 @@ impl Hadron {
             pointer_commit,
         })
     }
+    async fn release_pointer(
+        &self,
+        repo: &Repository,
+        release: &Value,
+        id: &str,
+        ctx: &Context,
+    ) -> Result<Option<Latest>> {
+        let assets = self
+            .github
+            .pages(
+                &format!(
+                    "{}/releases/{}/assets",
+                    repo.route(),
+                    github::number(release, "id")?
+                ),
+                ctx,
+            )
+            .await?;
+        let Some(a) = assets.iter().find(|a| a["name"] == "publication.json") else {
+            return Ok(None);
+        };
+        let size = github::number(a, "size")?;
+        let digest = github::str_field(a, "digest")?
+            .strip_prefix("sha256:")
+            .ok_or(Error::Integrity)?;
+        let hash = Hash::parse(digest)?;
+        Ok(Some(Latest {
+            schema_version: 1,
+            publication_id: id.into(),
+            index: Asset {
+                id: github::number(a, "id")?,
+                name: "publication.json".into(),
+                size,
+                sha256: hash.clone(),
+                decoded_size: size,
+                decoded_sha256: hash,
+            },
+        }))
+    }
     /// Owner-wide rollback: verify old publication then guardedly repoint stable.
     /// This does not modify source modlist or downgrade local worlds/saves.
     pub async fn select(
@@ -812,6 +1258,18 @@ impl Hadron {
             )
             .await
     }
+}
+fn reusable_failure(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::NotFound
+            | Error::Integrity
+            | Error::Codec
+            | Error::Schema(_)
+            | Error::Json(_)
+            | Error::Invalid(_)
+            | Error::Limit(_)
+    )
 }
 fn owner(repo: &Repository) -> Result<()> {
     if repo.permissions.push || repo.permissions.maintain || repo.permissions.admin {

@@ -5,7 +5,7 @@
 Hadron is the reusable Rust layer between a launcher such as Tachyon and a GitHub
 pack repository. It translates editable JSON into frontend-ready Rust models, and
 explicit user actions into request PRs, source commits, and published artifacts.
-Version **0.0.1** implements wire schema **1**. Pin this early API release while
+Version **0.0.2** implements wire schema **1**. Pin this early API release while
 integrating it. MIT-licensed source: <https://github.com/Izyawastaken/hadron-core>.
 
 ## Responsibilities and flows
@@ -28,7 +28,7 @@ server, registry of codes, daemon, or automatic background watcher is required.
 
 ```toml
 [dependencies]
-hadron-core = "=0.0.1"
+hadron-core = "=0.0.2"
 ```
 
 Import as `hadron_core`. Minimum supported Rust: **1.97**, edition 2024.
@@ -133,6 +133,19 @@ all API traffic. Reads revalidate hash/size; corruption is reported. Writes veri
 content and atomically promote temporary files without clobbering another writer.
 No automatic eviction deletes files needed by older publications.
 
+Strict cache errors remain default. Opt into `cache::CachePolicy::Recover` with
+`Hadron::with_cache_policy` to remove a corrupt content key and refetch, or continue
+after local cache I/O failure. Remote content must still pass all integrity checks.
+`Stage::CacheSkipped` reports the local fallback. `Cache::size` counts regular
+hash-named entries; `Cache::prune(maximum)` explicitly removes entries in hash order
+until that byte budget is reached, preserving foreign/temporary files. Coordinate
+eviction with other users of this trusted directory; this is not a cross-process
+quota. `Cache::remove` deletes only one caller-selected content key.
+
+Pointer metadata is bounded to 128 repository entries per adapter. Eviction is
+deterministic by repository ID, not LRU. `Github::clear_metadata(Some(id))` invalidates
+one entry; `None` clears all entries.
+
 [`diff::between`] produces an [`diff::UpdatePlan`] with old/new pack metadata,
 mods and configs. It supports update and rollback previews. Provider references
 remain exact download specifications for Tachyon. Hadron validates structure;
@@ -221,8 +234,11 @@ non-writer uses a verified fork; fork provisioning is asynchronous and may requi
 another explicit attempt. An existing unrelated repository with the same name
 is rejected. Private repository fork policy remains enforced.
 
-`Hadron::inspect` checks target repo/branch, the changed-file list, and exact ledger
-delta. Only one added request is permitted, with existing records/applied ledger
+`Hadron::inspect` checks target repo/branch and complete immutable Git trees at the
+captured head and its merge base with the captured target SHA. It does not depend
+on GitHub's moving PR file listing or truncated comparison file arrays. Truncated
+Git trees fail closed. The claimed request base must be an ancestor of the comparison
+base. Only one added request is permitted, with existing records/applied ledger
 unchanged. It returns a request and head SHA. Owner reviews these, then passes that
 SHA to `accept`. GitHub's merge SHA precondition rejects intervening PR edits.
 `proposals` returns typed open/closed/merged state. Merged status is distinct from
@@ -241,6 +257,32 @@ application; a commit cannot contain its own final hash. Replaying the same ID
 does not apply a change twice. `reject` closes an unmerged PR; an applied change
 needs a new proposal to reverse it. `base_publication` is context, while the exact
 base commit and expected entry govern edits.
+
+Merged recovery reads the immutable `merge_commit_sha` and first-parent tree in
+the target repository, so deleted forks and post-merge head edits do not prevent
+reconciliation. Merge and squash results are supported. For a multi-commit rebase,
+the final commit must contain the complete request delta; otherwise inspection
+fails closed. Hadron itself creates one request commit and merges with a merge
+commit. GitHub documents these result SHA semantics in its
+[pull request API](https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request).
+Applied markers short-circuit repeated reconciliation after confirming the PR is
+merged into the expected target. The commit containing the marker is the source
+of application provenance.
+
+Submission retries query PRs for the caller's specific head owner/branch and target
+branch. Unrelated PR history no longer counts toward that lookup budget. Use
+`Hadron::proposals_page(repo, page, ctx)` to browse 100 PRs at a time; the returned
+boolean indicates whether another raw page may exist, even when Hadron filtering
+returns no proposals. The original `proposals` remains a bounded whole-list helper.
+
+For long-running packs, `Hadron::archive_requests(repo, ids, expected_head, ctx)`
+atomically moves selected applied records out of `requests.json` and into
+`.hadron/requests/<id>.json`. Each file is a schema-1 `Requests` record with exactly
+one request and one applied PR number. IDs remain reserved; retries and reconciliation
+consult these records. Pending requests cannot be archived. Archive only after all
+writers upgrade to 0.0.2: 0.0.1 does not consult archives. History still consumes Git
+storage and counts toward the complete-tree budget; adjust limits deliberately for
+very large repositories. There is no automatic history deletion.
 
 Owner approval does not execute local work automatically. An explicit local publish
 operation runs next. Concurrent proposals editing the shared file can conflict;
@@ -277,16 +319,19 @@ configs. Complete configuration validation happens during publication preparatio
 
 `Hadron::prepare` fetches `pack.json`, `mods.json` and configs at an exact Git commit.
 It requires a complete recursive Git tree and rejects symlinks/submodules inside
-configs. Config files are fetched sequentially to bound memory/API pressure. The
+configs. Config files are fetched with bounded concurrency after prechecking total
+source bytes. The
 workflow builds on blocking workers. With `compression`, `codec::prepare` provides
 offline construction from an explicit byte map, whose provenance is caller-owned.
 
 `Hadron::publish(repo, id, source_commit, expected_head, context)`:
 
 1. Checks fresh maintainer permissions and exact identifiers.
-2. Prepares source locally and creates/reuses draft release `hadron-<id>`.
+2. Creates/reuses draft release `hadron-<id>` and prepares exact source locally.
 3. Uploads manifest/config assets and verifies uploaded bytes.
-4. Reuses prior configs when decoded content hash and size match.
+4. Reuses verified prior configs when immutable config Git entries match. A mod-only
+   change skips config source downloads and tar compression. A partial config edit
+   fetches only changed source files after verifying the old archive.
 5. Uploads raw `publication.json` and verifies the complete consumer path.
 6. Makes the complete release readable.
 7. Advances `.hadron/latest.json` through a fast-forward-only commit based on
@@ -294,6 +339,12 @@ offline construction from an explicit byte map, whose provenance is caller-owned
 
 Retry an interrupted operation using the **same publication ID and source SHA**.
 Existing assets are checked rather than overwritten. A conflicting ID is an error.
+Once `publication.json` exists, retries validate that index and its complete content
+against source and retain its exact asset IDs, independently of the currently selected
+release. A missing or corrupt optional previous release instead causes fresh artifacts
+and `Stage::ReuseSkipped`; cancellation, permission and transport failures propagate.
+Old config assets are checked remotely before reuse, even with a warm local cache,
+because their continued remote availability matters to new consumers.
 Do not delete older assets/releases: newer publications can reference unchanged
 config artifacts in them. The API supports GitHub.com upload origins, not arbitrary
 GitHub Enterprise asset hosts in this release.
@@ -376,14 +427,21 @@ These are supplied results, not independently reproduced throughput guarantees.
 Unchanged config bundles cost no artifact-download bytes in mod-only updates.
 Mod JARs are separate downloads; metadata compression does not shrink them.
 
-Default [`validation::Limits`]: JSON/source files 8 MiB; compressed artifact 64 MiB;
+Default [`validation::Limits`]: JSON/source JSON/decoded manifest 8 MiB; compressed artifact 64 MiB;
 decoded artifact 256 MiB; individual config 16 MiB; 10,000 entries; zstd maximum
-window log 27 (128 MiB). A source file must satisfy both its relevant source/body
-and config limits. Window memory is not total process RAM: compressed bytes,
-decoded tar, returned configs, serialization copies and window can coexist.
+window log 27 (128 MiB). Config source reads use the config budget, independently of
+the JSON budget. Git blob outbound envelopes allow base64 expansion plus 64 bytes
+overhead without raising inbound JSON limits. Manifest preparation enforces the same
+JSON limit as loading. Tar overhead counts toward decoded artifact bytes.
+Streaming removes complete uncompressed tar buffers; returned configs, compressed
+bytes, JSON and codec windows still coexist. These limits are not a process RAM quota.
 
 `github::Options` defaults: four network/CPU operations per client, 60 seconds per
-HTTP attempt including body reading, two extra transient GET attempts. Numeric
+HTTP attempt including body reading, two extra transient GET attempts, and one heavy
+workflow (`Options::workflows`, allowed range 1..=64). Admission happens before heavy
+fetches for load/prepare/publish and is cancellable. Independent adapters have independent
+budgets. A cancelled blocking task may finish after its workflow returns, but keeps
+its CPU permit. Numeric
 Retry-After and exhausted rate reset headers are honored; waits above 30 seconds
 return to caller. Each request/attempt has a deadline; workflows have no implicit
 overall deadline. Owned models favor integration clarity over zero-copy complexity.
@@ -400,25 +458,30 @@ deferred pending actual workload measurements.
 Run `cargo run --release --no-default-features --features compression --example measure`.
 This is deliberately synthetic, not evidence about real modpacks. A local Windows
 x86-64 run on Intel Core i7-13620H, Rust 1.97.1, zstd crate 0.13.4 / native 1.5.7,
-one encoder thread, 500 mod entries and 100 repetitive TOML configs reported:
+one encoder thread, 500 mod entries and 100 repetitive TOML configs reported for
+0.0.2 (single local smoke run, not a controlled before/after comparison):
 
 | Measurement | Observed |
 | --- | ---: |
 | Manifest raw / compressed | 154,717 / 27,641 bytes |
 | Config tar raw / compressed | 359,424 / 775 bytes |
-| Full prepare (single sample) | 11,786 microseconds |
-| Manifest decode (100-loop mean) | 451 microseconds |
-| Parse + validate + diff (100-loop mean) | 1,285 microseconds |
+| Full prepare (single sample) | 8,798 microseconds |
+| Manifest decode (100-loop mean) | 389 microseconds |
+| Parse + validate + diff (100-loop mean) | 1,050 microseconds |
 | Cold artifact bytes / warm artifact bytes | 28,416 / 0 |
 | One mod edit artifact bytes | 27,650 |
 | One config edit artifact bytes | 28,424 |
-| Observed process peak working set | 18,276,352 bytes |
+| Host-sampled process peak working set | 17,960,960 bytes |
 
-Artifact totals exclude discovery/index traffic and mod binaries. Peak working set
-was sampled by the host while the synthetic process ran; it includes allocations
-for preparation, repeated decoding/parsing and changed snapshots, not just decoder
-memory. Timings vary with load and are not throughput guarantees. Real packs should
+Artifact totals exclude discovery/index traffic and mod binaries. These timings
+do not measure a hard memory bound; host memory sampling includes the complete example
+and its retained snapshots. Timings vary with load and are not throughput guarantees. Real packs should
 be measured before changing codec/bundle granularity.
+
+Local mocked workflow regressions separately assert zero config source requests and
+zero config uploads for unchanged bundles, and one config source request for a
+one-file edit among two configs. These are deterministic request-count checks;
+loopback timing is not a claim about live GitHub throughput.
 
 ## Rollback, trust and recovery
 

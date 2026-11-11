@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 /// Resource limits applied before allocation/decompression where possible.
 #[derive(Clone, Debug)]
 pub struct Limits {
-    /// Maximum JSON response or source file, bytes.
+    /// Maximum inbound JSON/source JSON/decoded manifest, bytes. Outbound Git
+    /// blob envelopes allow base64 expansion plus 64 bytes independently.
     pub json_bytes: u64,
     /// Maximum downloaded artifact, bytes.
     pub compressed_bytes: u64,
@@ -217,11 +218,17 @@ pub fn requests(r: &Requests, limits: &Limits) -> Result<()> {
     for (id, req) in &r.requests {
         key(id)?;
         commit(&req.base_commit)?;
+        if let Some(publication) = &req.base_publication {
+            key(publication)?;
+        }
         if id != &req.id || req.reason.len() > 8192 {
             return Err(Error::Invalid("invalid request record".into()));
         }
     }
-    if r.applied.keys().any(|id| !r.requests.contains_key(id)) {
+    if r.applied
+        .iter()
+        .any(|(id, number)| *number == 0 || !r.requests.contains_key(id))
+    {
         return Err(Error::Invalid("applied request missing proposal".into()));
     }
     Ok(())
